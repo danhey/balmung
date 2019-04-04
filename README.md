@@ -2,6 +2,6 @@ Iteratively prewhitens frequencies in a time series using the Lomb-Scargle perio
 
 ### Setup
 
-Download the git files, and then
+`pip install balmung`, or download the git files, and then
 
 `python setup.py install`
