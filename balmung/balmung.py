@@ -1,143 +1,152 @@
-# -*- coding: utf-8 -*-
-
 from __future__ import division, print_function
 
 import numpy as np
-from tqdm import tqdm
-from scipy.optimize import leastsq
-from astropy.stats import LombScargle
+from astropy.timeseries import LombScargle
+from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
+import tqdm
 
-class Balmung(object):
-    def __init__(self, t, y):
-        self.t = t
-        self.y = y
-        self.residual = y
 
-        #self.prewhitened_values = []
-        self.prewhitened_f = []
-        self.prewhitened_amp = []
-        self.prewhitened_phase = []
+class Balmung:
+    def __init__(self, time: np.ndarray, flux: np.ndarray):
+        """The big cheese. does prewhitening
 
-    def run(self, steps=1, fmin=None, fmax=None, harmonics=0, verbose=False, memory=False,
-            **kwargs):
-
-        for j in tqdm(range(steps)):
-            # Calculate periodogram
-            freq, amp = self.periodogram(self.t, self.residual, fmin=fmin, fmax=fmax)
-
-            # Find frequency of highest peak
-            max_freq = self.find_highest_peak(freq, amp)
-
-            # Prewhiten frequency and harmonics specified
-            for i in np.arange(0,harmonics+1):
-                # Current frequency
-                f0 = max_freq * (i+1)
-
-                # Use DFT to estimate values for least squares for current frequency
-                amp0, phase0 = self.dft(self.t, self.residual, f0)
-                
-                self.prewhitened_f.append(f0)
-                self.prewhitened_amp.append(amp0)
-                self.prewhitened_phase.append(phase0)
-
-                if memory:
-                    # Fit time series USING ALL PREVIOUS FREQUENCIES FOR BETTER FIT
-                    f_fit, amp_fit, phase_fit = self.fit_timeseries(self.t, self.y, self.prewhitened_f,
-                                                                                    self.prewhitened_amp,
-                                                                                    self.prewhitened_phase)
-                    self.residual = self.prewhiten(self.t, self.y, f_fit, amp_fit, phase_fit)
-
-                else:
-                    f_fit, amp_fit, phase_fit = self.fit_timeseries(self.t, self.residual, f0,amp0,phase0)
-                    # Prewhiten time series
-                    self.residual = self.prewhiten(self.t, self.residual, f_fit, amp_fit, phase_fit)
-
-                # Log removed frequencies
-                self.prewhitened_f = f_fit
-                self.prewhitened_amp = amp_fit
-                self.prewhitened_phase = phase_fit
-
-        if verbose:
-            print('Frequency')
-            print(self.prewhitened_f)
-
-    def plot(self, ax=None, **kwargs):
-
-        if ax is None:
-            fig, ax = plt.subplots()
-        
-        freq, power = self.periodogram(self.t, self.residual, **kwargs)
-        ax.plot(freq, power)
-
-        ax.set_xlim([freq[0], freq[-1]])
-        ax.set_ylim([0, None])
-        return ax
-
-    def periodogram(self, t, y, fmin=None, fmax=None, oversample=2, mode='amplitude'):
-        
-        tmax = t.max()
-        tmin = t.min()
-        dt = np.median(np.diff(t))
-
-        df = 1.0 / (tmax-tmin)
-        ny = 0.5 / dt
-
-        if fmin is None:
-            fmin = df
-        if fmax is None:
-            fmax = ny
-        freq = np.arange(fmin, fmax, df/oversample)
-        sc = LombScargle(t, y).power(freq, method="fast", normalization="psd")
-        fct = np.sqrt(4./len(t))
-
-        if mode == 'amplitude':
-            sc = np.sqrt(np.abs(sc)) * fct
-        elif mode == 'power':
-            sc = fct**2. * sc
-        return freq, sc
-
-    def prewhiten(self, t, a, freq, amp, phi):
+        Args:
+            time (np.ndarray): Time values
+            flux (np.ndarray): Flux value corresponding to `time`
         """
-        Prewhitens a time series using a harmonic function with the given
-        frequencies, amplitudes and phases.
+        self.time = time
+        self.flux = flux - np.median(flux)
+        self.residual = np.copy(self.flux)
+        self.removed = []
+
+    def prewhiten(self, fmin=None, fmax=None, minimum_snr=5, maxiter=100, diagnose=True):
+        # Calculate initial amplitude spectrum
+        freq, amp = self.amplitude_spectrum(self.time, self.residual, fmin=fmin, fmax=fmax)
+
+        # # Estimate noise level:
+        # bkg = self.estimate_background(freq, amp)
+        # snr = amp / bkg
+
+        # Get first guess:
+        # idx = np.nanargmax(snr)
+        # f0, a0 = freq[idx], amp[idx]
+        # phi0 =
+
+        noise_level = minimum_snr * np.median(amp)
+        f0, a0, phi0 = self.initialize_guess(fmin=fmin, fmax=fmax)
+
+        for i in tqdm.tqdm(range(maxiter)):
+            if a0 > noise_level:
+                # Fit theta to lc
+                popt = self.fit([f0, a0, phi0])
+                self.removed.append(popt.tolist())
+
+                # Subtract off the fitted model
+                self.residual -= self.model(self.time, *popt)
+
+                # Get new params for next iteration
+                f0, a0, phi0 = self.initialize_guess(fmin=fmin, fmax=fmax)
+            else:
+                break
+
+        if diagnose:
+            pass
+            # Do some diagnostic shit
+
+    def fit(self, theta: list) -> np.ndarray:
+        """Small wrapper for curve_fit.
+
+        Args:
+            time (np.ndarray): Time values
+            flux (np.ndarray): Flux values
+            theta (list): Array-like of initial guesses
+
+        Returns:
+            list: Fitted parameters
         """
-        t, a, freq, amp, phi = np.atleast_1d(t, a, freq, amp, phi)
-        return a - self.harmfunc(t, freq, amp, phi)
+        popt, _ = curve_fit(
+            self.model, self.time, self.residual, p0=theta, jac=self.grad_model
+        )
 
-    def fit_timeseries(self, t, a, freq0, amp0, phase0, **kwargs):
+        # I don't expect this to happen.. but if the amplitude goes negative let's fix it:
+        if popt[1] < 0:
+            popt[1] *= -1.
+            popt[2] += np.pi
+
+        return popt
+
+    def grad_model(
+        self, time: np.ndarray, freq: float, amp: float, phi: float
+    ) -> np.ndarray:
+        """Gradient function of our pulsation model
+
+        Args:
+            time (np.ndarray): Time values
+            freq (float): Frequency
+            amp (float): Amplitude
+            phi (float): Phase
+
+        Returns:
+            np.ndarray: Gradient vector (dModel/d_{freq,amp,phi})
         """
-        Fit a time series using a harmonic function with a fixed set of
-        frequencies to determine corresponding amplitudes and phases.
+        factor = 2 * np.pi * freq * time + phi
+        return np.array(
+            [
+                -2 * np.pi * amp * time * np.sin(factor),
+                np.cos(factor),
+                -1 * amp * np.sin(factor),
+            ]
+        ).T
+
+    def model(self, time:np.ndarray, freq:float, amp:float, phi:float) -> np.ndarray:
+        """And at the heart of it all, a tiny model function.
+
+        Args:
+            time (np.ndarray): Time values
+            freq (float): Frequency
+            amp (float): Amplitude
+            phi (float): Phase
+
+        Returns:
+            np.ndarray: Sinusoid at the given parameters
         """
+        return amp * np.cos((2 * np.pi * freq * time) + phi)
 
-        # Perform leastsq fit.
-        x, _, _, _, _ = leastsq(
-            self._minfunc, x0=np.array([freq0, amp0, phase0]), args=(t, a),
-            Dfun=None, full_output=1, col_deriv=1, **kwargs)
-        x = x.tolist()
+    def estimate_background(
+        self, x: np.ndarray, y: np.ndarray, log_width: float = 0.01
+    ) -> np.ndarray:
+        """Estimates the background signal
 
-        # Extract amplitudes and phases from the fit result.
-        nn = len(x) // 3
-        nu, amp, phi = x[:nn], x[nn:2*nn], x[2*nn:]
+        Args:
+            x (np.ndarray): [description]
+            y (np.ndarray): [description]
+            log_width (float, optional): [description]. Defaults to 0.01.
 
-        # Normalizing the results
-
-        #idx = amp < 0
-        #amp[idx] *= -1.0
-        #phi[idx] += 0.5
-        #phi = np.mod(phi, 1)
-
-        #nu = nu.tolist()
-        #amp = amp.tolist()
-        #phi = phi.tolist()
-        return nu, amp, phi
-
-    def find_highest_peak(self, nu, p):
+        Returns:
+            [type]: [description]
         """
-        Find the frequency of the highest peak in the periodogram, using a
-        3-point parabolic interpolation.
+        count = np.zeros(len(x), dtype=int)
+        bkg = np.zeros_like(x)
+        x0 = np.log10(x[0])
+        while x0 < np.log10(x[-1]):
+            m = np.abs(np.log10(x) - x0) < log_width
+            bkg[m] += np.median(y[m])
+            count[m] += 1
+            x0 += 0.5 * log_width
+        return bkg / count
+
+    def find_highest_peak(self, f: np.ndarray, a: np.ndarray) -> float:
+        """Uses three point parabolic interpolation to find the highest peaks in the amplitude spectrum
+
+        Args:
+            f (np.ndarray): Frequency values
+            a (np.ndarray): Amplitude values
+
+        Returns:
+            float: Maximum frequency
         """
+        nu, p = f, a
         nu, p = np.atleast_1d(nu, p)
 
         # Get index of highest peak.
@@ -147,49 +156,106 @@ class Balmung(object):
         if imax == 0 or imax == p.size - 1:
             nu_peak = p[imax]
         else:
-            # Get values around the maximum.
-            frq1 = nu[imax-1]
+            # Get values around the maximum. This is kinda gross
+            frq1 = nu[imax - 1]
             frq2 = nu[imax]
-            frq3 = nu[imax+1]
-            y1 = p[imax-1]
+            frq3 = nu[imax + 1]
+            y1 = p[imax - 1]
             y2 = p[imax]
-            y3 = p[imax+1]
+            y3 = p[imax + 1]
 
             # Parabolic interpolation formula.
-            t1 = (y2-y3) * (frq2-frq1)**2 - (y2-y1) * (frq2-frq3)**2
-            t2 = (y2-y3) * (frq2-frq1) - (y2-y1) * (frq2-frq3)
-            nu_peak = frq2 - 0.5 * t1/t2
+            t1 = (y2 - y3) * (frq2 - frq1) ** 2 - (y2 - y1) * (frq2 - frq3) ** 2
+            t2 = (y2 - y3) * (frq2 - frq1) - (y2 - y1) * (frq2 - frq3)
+            nu_peak = frq2 - 0.5 * t1 / t2
         return nu_peak
 
-    def harmfunc(self, t, nu, amp, phi):
+    def amplitude_spectrum(
+        self, t, y, fmin: float = None, fmax: float = None, oversample_factor: float = 5.0,
+    ) -> tuple:
+        """Calculates the amplitude spectrum at a given time and flux input
+
+        Args:
+            t (np.ndarray): Time values
+            y (np.ndarray): Flux values
+            fmin (float, optional): Minimum frequency. Defaults to None.
+            fmax (float, optional): Maximum frequency. Defaults to None.
+            oversample_factor (float, optional): Amount by which to oversample the light curve. Defaults to 5.0.
+
+        Returns:
+            tuple: Frequency and amplitude arrays
         """
-        Harmonic model function. Returns a time series of harmonic 
-        functions with frequencies nu, amplitudes amp and phases phi.
+        # t, y = self.time, self.residual
+        tmax = t.max()
+        tmin = t.min()
+        df = 1.0 / (tmax - tmin)
+
+        if fmin is None:
+            fmin = df
+        if fmax is None:
+            fmax = 0.5 / np.median(np.diff(t))  # *nyq_mult
+
+        freq = np.arange(fmin, fmax, df / oversample_factor)
+        model = LombScargle(t, y)
+        sc = model.power(freq, method="fast", normalization="psd")
+
+        fct = np.sqrt(4.0 / len(t))
+        amp = np.sqrt(sc) * fct
+
+        return freq, amp
+
+    def dft_phase(self, x: np.ndarray, y: np.ndarray, f: float) -> float:
+        """Calculates the phase at a single frequency using the Discrete Fourier Transform
+
+        Args:
+            x (np.ndarray): Time values
+            y (np.ndarray): Flux values
+            f (float): Frequency
+
+        Returns:
+            float: Phase at given frequency
         """
-        t, nu, amp, phi = np.atleast_1d(t, nu, amp, phi)
-        n = len(nu)
-        res = np.zeros(len(t))
-        for i in range(n):
-            res += amp[i] * np.sin(2 * np.pi * (nu[i] * t + phi[i]))
-        return res
+        expo = 2.0 * np.pi * f * x
+        return np.arctan2(np.sum(y * np.sin(expo)), np.sum(y * np.cos(expo)))
 
-    def _minfunc(self, theta, xdat, ydat):
-        """ Don't ask me why least squares flattens the x0 array.."""
-        nn = len(theta) // 3
-        nu, amp, phi = theta[:nn], theta[nn:2*nn], theta[2*nn:]
+    def initialize_guess(self, fmin: float, fmax: float):
+        time, flux = self.time, self.residual
+        f, a = self.amplitude_spectrum(time, flux, fmin=fmin, fmax=fmax, oversample_factor=5.0)
 
-        return ydat - self.harmfunc(xdat, nu, amp, phi)
+        # Get freq of max power using parabolic interpolation
+        f0 = self.find_highest_peak(f, a)
+        # Calculate a0 at f0
+        a0 = np.sqrt(
+            LombScargle(time, flux).power(f0, method="fast", normalization="psd")
+        ) * np.sqrt(4.0 / len(time))
+        # Calculate phi0, since ASTC needs to be negative
+        phi0 = -1 * self.dft_phase(time, flux, f0)
+        return f0, a0, phi0
 
-    def dft(self, x, y, freq, verbose=False):
-        """Slow DFT for estimating amplitude and phase at single frequency"""
-        freq = np.asarray(freq)        
-        x = np.array(x)
-        y = np.array(y)
+    def plot_lc(self, ax=None):
+        if ax is None:
+            fig, ax = plt.subplots()
+        ax.plot(self.time, self.flux)
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Flux")
+        return ax
 
-        expo = 2.0 * np.pi * freq * x
-        ft_real = np.sum(y * np.cos(expo))
-        ft_imag = np.sum(y * np.sin(expo))
-        #phase = np.arctan2(ft_imag,ft_real)
-        phase = np.arctan(ft_imag/ft_real)
-        amp = np.abs((ft_real+ft_imag) / (len(x)/2))
-        return amp, phase
+    def plot_residual(self, ax=None):
+        if ax is None:
+            fig, ax = plt.subplots()
+        ax.plot(self.time, self.residual)
+        ax.set_xlabel("Time")
+        ax.set_ylabel("Flux")
+        return ax
+
+    def plot(self, ax=None):
+        if ax is None:
+            _, ax = plt.subplots()
+        f, a = self.amplitude_spectrum(self.time, self.flux)
+        ax.plot(f, a, lw=0.7, c="black")
+        ax.set_xlabel("Frequency")
+        ax.set_ylabel("Amplitude")
+        rem = np.array(self.removed)
+        ax.plot(rem[:,0], rem[:,1], 'v', alpha=0.7)
+        return ax
+
